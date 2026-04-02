@@ -1,0 +1,15 @@
+[project]
+name = "agentcore-rag"
+version = "0.1.0"
+description = "Agentic RAG on AgentCore Runtime with grep/glob-based search"
+requires-python = ">=3.13"
+dependencies = [
+    "bedrock-agentcore",
+    "claude-agent-sdk",
+    "aws-opentelemetry-distro",
+]
+
+[dependency-groups]
+dev = [
+    "bedrock-agentcore-starter-toolkit",
+]
