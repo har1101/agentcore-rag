@@ -125,19 +125,20 @@ Claude Code の開発者 Boris Cherny によると、初期の Claude Code は R
 
 ```
 agentcore-rag/
-├── Dockerfile                     # AgentCore Runtime コンテナイメージ
-├── .dockerignore                  # Docker ビルド時の除外設定
-├── pyproject.toml                 # Python 依存パッケージ (uv)
-├── uv.lock                        # uv ロックファイル
-├── config.py                      # 設定値（KB パス, ターン数, system prompt）
-├── app.py                         # AgentCore entrypoint（Claude Agent SDK 呼出し）
-├── knowledge_base/                # Phase 1 用バンドルナレッジベース
-│   ├── docs/
-│   │   ├── agentic-search.md
-│   │   └── agentcore-runtime.md
-│   └── src/
-│       ├── example_agent.py
-│       └── utils.ts
+├── agent/                         # AgentCore Runtime コンテナ（Docker コンテキスト）
+│   ├── Dockerfile
+│   ├── .dockerignore
+│   ├── pyproject.toml             # Python 依存パッケージ (uv)
+│   ├── uv.lock
+│   ├── config.py                  # 設定値（KB パス, ターン数, system prompt）
+│   ├── app.py                     # AgentCore entrypoint（Claude Agent SDK 呼出し）
+│   └── knowledge_base/            # Phase 1 用バンドルナレッジベース
+│       ├── docs/
+│       │   ├── agentic-search.md
+│       │   └── agentcore-runtime.md
+│       └── src/
+│           ├── example_agent.py
+│           └── utils.ts
 ├── docs/
 │   └── design.md                  # 本ドキュメント
 └── infra/                         # AWS CDK プロジェクト (TypeScript)
@@ -232,11 +233,11 @@ CMD ["uv", "run", "opentelemetry-instrument", "python", "app.py"]
 ```
 .venv
 __pycache__
-infra/cdk.out
-infra/node_modules
 ```
 
-**なぜ必要か**: ローカルで `uv run` を実行すると macOS (darwin/arm64) 向けの `.venv` がプロジェクトルートに生成される。Docker の `COPY . ./` でこれがコンテナにコピーされると、`uv sync --frozen` で作られた Linux 向け `.venv` が上書きされ、`Exec format error (os error 8)` でコンテナが起動不能になる。Docker 自身の `.dockerignore` と CDK の `exclude` オプションの二重防御で除外している。
+**なぜ必要か**: ローカルで `uv run` を実行すると macOS (darwin/arm64) 向けの `.venv` が `agent/` 内に生成される。Docker の `COPY . ./` でこれがコンテナにコピーされると、`uv sync --frozen` で作られた Linux 向け `.venv` が上書きされ、`Exec format error (os error 8)` でコンテナが起動不能になる。Docker 自身の `.dockerignore` と CDK の `exclude` オプションの二重防御で除外している。
+
+`agent/` ディレクトリを Docker コンテキストとして分離したことで、`infra/` 配下（`cdk.out`, `node_modules` 等）は自然に除外され、`.dockerignore` がシンプルになった。
 
 ### 5.4 `config.py`
 
@@ -366,9 +367,9 @@ const kbBucket = new s3.Bucket(this, "KnowledgeBaseBucket", {
 
 ```typescript
 const agentImage = new ContainerImageBuild(this, "AgentImage", {
-  directory: path.join(__dirname, "..", ".."), // プロジェクトルート
+  directory: path.join(__dirname, "..", "..", "agent"),
   platform: Platform.LINUX_ARM64,
-  exclude: ["infra/cdk.out", "infra/node_modules", ".venv"],
+  exclude: [".venv"],
 });
 ```
 
@@ -377,10 +378,9 @@ const agentImage = new ContainerImageBuild(this, "AgentImage", {
 - ARM64 イメージを x86 マシンからでも確実にビルドできる（CodeBuild の ARM インスタンスを使用）
 - CI/CD 環境でも Docker-in-Docker 問題を回避
 
-**なぜ `exclude` が必要か**:
-- `infra/cdk.out`: CDK のシンセサイズ出力。Docker コンテキストに含めると `cdk.out/asset.xxx/infra/cdk.out/...` と再帰コピーが発生し `ENAMETOOLONG` エラーになる
-- `infra/node_modules`: CDK の依存パッケージ。不要かつ巨大
-- `.venv`: ローカルで `uv run` すると macOS 向けバイナリの `.venv` が生成される。これがコンテナにコピーされると `Exec format error` でコンテナが起動不能になる（5.3 節参照）
+**なぜ `directory` を `agent/` に分離したか**: 当初はプロジェクトルートを Docker コンテキストとしていたが、`infra/cdk.out/` が再帰コピーされ `ENAMETOOLONG` エラーになる問題があった。`agent/` に分離することで `infra/` が Docker コンテキスト外となり、`exclude` は `.venv` のみでシンプルになった。
+
+**なぜ `.venv` の `exclude` が必要か**: ローカルで `uv run` すると macOS 向けバイナリの `.venv` が生成される。これがコンテナにコピーされると `Exec format error` でコンテナが起動不能になる（5.3 節参照）。`.dockerignore` との二重防御。
 
 ##### (3) AgentCore Runtime
 

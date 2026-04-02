@@ -29,9 +29,9 @@ export class AgentcoreRagStack extends cdk.Stack {
 
     // ===== AgentCore Runtime =====
     const agentImage = new ContainerImageBuild(this, "AgentImage", {
-      directory: path.join(__dirname, "..", ".."), // project root (Dockerfile location)
+      directory: path.join(__dirname, "..", "..", "agent"),
       platform: Platform.LINUX_ARM64,
-      exclude: ["infra/cdk.out", "infra/node_modules", ".venv"],
+      exclude: [".venv"],
     });
 
     const runtime = new agentcore.Runtime(this, "Runtime", {
