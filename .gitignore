@@ -21,3 +21,6 @@ cdk.out/
 # Lambda bundled dependencies (installed via uv pip install)
 infra/lambda/*
 !infra/lambda/sync_handler.py
+
+# Scripts with hardcoded account info
+scripts/

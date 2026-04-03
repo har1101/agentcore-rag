@@ -16,7 +16,7 @@ export class AgentcoreRagStack extends cdk.Stack {
     super(scope, id, props);
 
     // Fixed session ID shared between Lambda sync and user queries (must be >= 33 chars)
-    const sessionId = "agentcore-rag-shared-session-00000001";
+    const sessionId = "agentcore-rag-shared-session-00000002";
     const s3Prefix = "knowledge_base/";
 
     // ===== S3 Bucket (Knowledge Base source) =====
@@ -56,22 +56,30 @@ export class AgentcoreRagStack extends cdk.Stack {
       agentImage.imageTag,
     ]);
 
+    // UpdateAgentRuntime replaces the entire config, so ALL fields must be passed
+    // (including environmentVariables) to avoid wiping them out.
+    const updateParams = {
+      agentRuntimeId: runtime.agentRuntimeId,
+      agentRuntimeArtifact: {
+        containerConfiguration: { containerUri },
+      },
+      roleArn: runtime.role.roleArn,
+      networkConfiguration: { networkMode: "PUBLIC" },
+      environmentVariables: {
+        SESSION_STORAGE_MOUNT: "/mnt/session",
+        S3_BUCKET: kbBucket.bucketName,
+      },
+      filesystemConfigurations: [
+        { sessionStorage: { mountPath: "/mnt/session" } },
+      ],
+    };
+
     new cr.AwsCustomResource(this, "EnableSessionStorage", {
       installLatestAwsSdk: true,
       onCreate: {
         service: "bedrock-agentcore-control",
         action: "UpdateAgentRuntime",
-        parameters: {
-          agentRuntimeId: runtime.agentRuntimeId,
-          agentRuntimeArtifact: {
-            containerConfiguration: { containerUri },
-          },
-          roleArn: runtime.role.roleArn,
-          networkConfiguration: { networkMode: "PUBLIC" },
-          filesystemConfigurations: [
-            { sessionStorage: { mountPath: "/mnt/session" } },
-          ],
-        },
+        parameters: updateParams,
         physicalResourceId: cr.PhysicalResourceId.of(
           "session-storage-config",
         ),
@@ -79,17 +87,7 @@ export class AgentcoreRagStack extends cdk.Stack {
       onUpdate: {
         service: "bedrock-agentcore-control",
         action: "UpdateAgentRuntime",
-        parameters: {
-          agentRuntimeId: runtime.agentRuntimeId,
-          agentRuntimeArtifact: {
-            containerConfiguration: { containerUri },
-          },
-          roleArn: runtime.role.roleArn,
-          networkConfiguration: { networkMode: "PUBLIC" },
-          filesystemConfigurations: [
-            { sessionStorage: { mountPath: "/mnt/session" } },
-          ],
-        },
+        parameters: updateParams,
         physicalResourceId: cr.PhysicalResourceId.of(
           "session-storage-config",
         ),

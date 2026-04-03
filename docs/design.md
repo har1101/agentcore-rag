@@ -131,16 +131,16 @@ agentcore-rag/
 │   ├── pyproject.toml             # Python 依存パッケージ (uv)
 │   ├── uv.lock
 │   ├── config.py                  # 設定値（KB パス, ターン数, system prompt）
-│   ├── app.py                     # AgentCore entrypoint（Claude Agent SDK 呼出し）
-│   └── knowledge_base/            # Phase 1 用バンドルナレッジベース
+│   └── app.py                     # AgentCore entrypoint（Claude Agent SDK 呼出し）
+├── docs/
+│   ├── design.md                  # 本ドキュメント
+│   └── knowledge_base/            # ナレッジベースソース（S3 経由で Session Storage に同期）
 │       ├── docs/
 │       │   ├── agentic-search.md
 │       │   └── agentcore-runtime.md
 │       └── src/
 │           ├── example_agent.py
 │           └── utils.ts
-├── docs/
-│   └── design.md                  # 本ドキュメント
 └── infra/                         # AWS CDK プロジェクト (TypeScript)
     ├── bin/
     │   └── infra.ts               # CDK app エントリポイント
@@ -267,15 +267,28 @@ You are a knowledge base assistant. ...
 
 ```python
 import json
+import logging
 import os
-from dataclasses import asdict
+from typing import Any
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from claude_agent_sdk import query, ClaudeAgentOptions
+from claude_agent_sdk.types import (
+    AssistantMessage, ResultMessage, StreamEvent, SystemMessage,
+    TextBlock, ToolResultBlock, ToolUseBlock, UserMessage,
+)
 
 from config import KNOWLEDGE_BASE_DIR, SYSTEM_PROMPT, MAX_TURNS
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="[agent] %(message)s")
+
 app = BedrockAgentCoreApp()
+
+def _emit_event(event: str, data: dict[str, Any]) -> dict[str, str]:
+    return {
+        "message": json.dumps({"event": event, "data": data}, ensure_ascii=False)
+    }
 
 @app.entrypoint
 async def invocations(payload, context):
@@ -284,25 +297,137 @@ async def invocations(payload, context):
     options = ClaudeAgentOptions(
         tools=["Read", "Grep", "Glob"],
         allowed_tools=["Read", "Grep", "Glob"],
+        include_partial_messages=True,
         system_prompt=SYSTEM_PROMPT,
         permission_mode="bypassPermissions",
         max_turns=MAX_TURNS,
         cwd=KNOWLEDGE_BASE_DIR,
     )
 
+    pending_tool_uses = {}
+    streamed_assistant_output = False
+
     async for message in query(prompt=prompt, options=options):
-        data = {"type": message.__class__.__name__, **asdict(message)}
-        yield {"message": json.dumps(data, ensure_ascii=False)}
+        if isinstance(message, StreamEvent):
+            streamed_assistant_output = True
+            event = message.event
+            event_type = event.get("type")
+
+            if event_type == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    yield _emit_event("text_delta", {"text": delta.get("text", "")})
+
+            elif event_type == "content_block_start":
+                content_block = event.get("content_block", {})
+                if content_block.get("type") == "tool_use":
+                    pending_tool_uses[event["index"]] = {
+                        "id": content_block.get("id"),
+                        "name": content_block.get("name"),
+                        "chunks": [],
+                    }
+                    yield _emit_event(
+                        "tool_use_start",
+                        {"id": content_block.get("id"), "name": content_block.get("name")},
+                    )
+
+            elif event_type == "content_block_stop":
+                tool_state = pending_tool_uses.pop(event.get("index"), None)
+                if tool_state:
+                    yield _emit_event(
+                        "tool_use",
+                        {"id": tool_state["id"], "name": tool_state["name"], "input": ...},
+                    )
+            continue
+
+        if isinstance(message, SystemMessage) and message.subtype == "init":
+            logger.info("model: %s", message.data.get("model"))
+
+        if isinstance(message, AssistantMessage):
+            if streamed_assistant_output:
+                continue
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    yield _emit_event("message", {"text": block.text})
+                elif isinstance(block, ToolUseBlock):
+                    yield _emit_event(
+                        "tool_use",
+                        {"id": block.id, "name": block.name, "input": block.input},
+                    )
+
+        if isinstance(message, UserMessage) and isinstance(message.content, list):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    yield _emit_event(
+                        "tool_result",
+                        {"tool_use_id": block.tool_use_id, "content": ..., "is_error": ...},
+                    )
+
+        if isinstance(message, ResultMessage):
+            yield _emit_event("result", {...})
+```
+
+**ストリーミングイベント一覧**:
+
+| event | 内容 | 送信先 |
+|-------|------|--------|
+| `text_delta` | Claude の逐次テキスト断片 | クライアント |
+| `message` | 非ストリーミング時のフォールバック全文 | クライアント |
+| `tool_use_start` | ツール開始通知（name） | クライアント + ログ |
+| `tool_use` | ツール呼出し確定版（id, name, input） | クライアント + ログ |
+| `tool_result` | ツール実行結果（content） | クライアント + ログ |
+| `result` | 完了統計（turns, cost, duration） | クライアント + ログ |
+
+**設計判断**:
+- **`include_partial_messages=True`**: Claude Agent SDK はデフォルトでは完成済み `AssistantMessage` だけを返す。公式ドキュメントどおり `StreamEvent` を有効化し、`content_block_delta` の `text_delta` と `input_json_delta` を拾うことで、トークン単位の表示とツール入力の途中経過を扱えるようにした（[Streaming output](https://platform.claude.com/docs/en/agent-sdk/streaming-output)）
+- **`StreamEvent` 優先、`AssistantMessage` はフォールバック**: partial messages を有効化すると `StreamEvent` の後で完全な `AssistantMessage` も届くため、そのまま両方流すと重複表示になる。ストリーミングが来ている間は `AssistantMessage` の本文を抑止し、非対応ケースだけ `message` イベントにフォールバックする
+- **型付き dataclass での判定**: `claude_agent_sdk.types` から `AssistantMessage`, `StreamEvent`, `ToolResultBlock` 等をインポートし `isinstance()` で型チェック。文字列比較より安全で、IDE の補完も効く（[Python Agent SDK リファレンス](https://platform.claude.com/docs/en/agent-sdk/python)）
+- **全イベントをストリーミング**: テキスト応答だけでなく、ツール開始・確定入力・実行結果・完了統計もクライアントに yield。エージェントの探索過程をターミナル上で追える
+- **構造化ログ**: `[agent]` prefix で CloudWatch 上でフィルタしやすくする
+- **ResultMessage で統計**: ターン数・コスト・所要時間をログ出力し、パフォーマンス監視に活用
+- `tools=["Read", "Grep", "Glob"]` でデフォルトツールのみ有効化。Write / Bash は無効 → ナレッジベースの改変を防止
+- `cwd=KNOWLEDGE_BASE_DIR` でツールの検索スコープをナレッジベースに制限
+- `permission_mode="bypassPermissions"` でサーバーサイド実行時のツール承認をスキップ
+- **既知の制約も明示**: 公式ドキュメントでは `max_thinking_tokens` を明示指定した場合は `StreamEvent` が出ない。今回は thinking を有効化していないため、partial message streaming と両立できる
+
+参考:
+- [Claude Agent SDK Python リファレンス](https://platform.claude.com/docs/en/agent-sdk/python)
+- [ストリーミング出力](https://platform.claude.com/docs/en/agent-sdk/streaming-output)
+
+### 5.6 `scripts/query.py`
+
+ローカル確認用スクリプトは AgentCore Runtime の SSE を最後まで `read()` せず、その場で逐次表示する。
+
+```python
+def _iter_sse_lines(body):
+    for line in body.iter_lines():
+        yield line.decode("utf-8") if isinstance(line, bytes) else str(line)
+
+def query_agent(...):
+    response = client.invoke_agent_runtime(...)
+    body = response["response"]
+
+    for part in _iter_sse_lines(body):
+        if not part.startswith("data: "):
+            continue
+        data = json.loads(part[6:])
+        parsed = json.loads(data["message"])
+
+        if parsed["event"] == "text_delta":
+            sys.stdout.write(parsed["data"]["text"])
+            sys.stdout.flush()
+        elif parsed["event"] == "tool_use":
+            print(f"[tool] {parsed['data']['name']} {parsed['data']['input']}")
+        elif parsed["event"] == "tool_result":
+            print(parsed["data"]["content"])
 ```
 
 **設計判断**:
-- `async` entrypoint + `yield` によるストリーミングレスポンス（AgentCore Runtime の推奨パターン）
-- `tools=["Read", "Grep", "Glob"]` でデフォルトツールのみ有効化。カスタムツールは不要（Claude Code と同じ実装がそのまま使える）
-- `cwd=KNOWLEDGE_BASE_DIR` でツールの検索スコープをナレッジベースに制限
-- `permission_mode="bypassPermissions"` でサーバーサイド実行時のツール承認をスキップ
-- Write / Bash ツールは有効化しない → ナレッジベースの改変を防止
+- **`body.read()` を廃止**: 既存実装はレスポンス全体を読み切ってから表示していたため、ターミナルではストリーミングに見えなかった。`iter_lines()` で SSE を逐次消費する形に変更
+- **イベント種別ごとに描画**: `text_delta` は改行なしで追記し、`tool_use` / `tool_result` / `result` は区切って表示。回答本文とツール実行ログが混ざっても読めるようにした
+- **旧 `message` イベントも互換維持**: ストリーミング非対応のケースや古いランタイム出力でも最低限の表示ができるようフォールバックを残した
 
-### 5.6 `infra/lambda/sync_handler.py`
+### 5.7 `infra/lambda/sync_handler.py`
 
 Lambda の全文はリポジトリの `infra/lambda/sync_handler.py` を参照。
 
@@ -405,23 +530,30 @@ const runtime = new agentcore.Runtime(this, "Runtime", {
 ##### (4) Session Storage の有効化 (Custom Resource)
 
 ```typescript
+// UpdateAgentRuntime replaces the entire config, so ALL fields must be passed
+const updateParams = {
+  agentRuntimeId: runtime.agentRuntimeId,
+  agentRuntimeArtifact: { containerConfiguration: { containerUri } },
+  roleArn: runtime.role.roleArn,
+  networkConfiguration: { networkMode: "PUBLIC" },
+  environmentVariables: {
+    SESSION_STORAGE_MOUNT: "/mnt/session",
+    S3_BUCKET: kbBucket.bucketName,
+  },
+  filesystemConfigurations: [
+    { sessionStorage: { mountPath: "/mnt/session" } },
+  ],
+};
+
 new cr.AwsCustomResource(this, "EnableSessionStorage", {
   installLatestAwsSdk: true,
   onCreate: {
     service: "bedrock-agentcore-control",
     action: "UpdateAgentRuntime",
-    parameters: {
-      agentRuntimeId: runtime.agentRuntimeId,
-      agentRuntimeArtifact: { containerConfiguration: { containerUri } },
-      roleArn: runtime.role.roleArn,
-      networkConfiguration: { networkMode: "PUBLIC" },
-      filesystemConfigurations: [
-        { sessionStorage: { mountPath: "/mnt/session" } },
-      ],
-    },
+    parameters: updateParams,
     physicalResourceId: cr.PhysicalResourceId.of("session-storage-config"),
   },
-  // ... onUpdate も同様
+  onUpdate: { /* 同じ updateParams */ },
   policy: cr.AwsCustomResourcePolicy.fromStatements([
     new iam.PolicyStatement({
       actions: ["bedrock-agentcore:UpdateAgentRuntime"],
@@ -439,6 +571,8 @@ new cr.AwsCustomResource(this, "EnableSessionStorage", {
 
 参考: [Amazon Bedrock AgentCore Runtime にSession Storage が追加されました](https://dev.classmethod.jp/articles/bedrock-agentcore-runtime-session-storage/)
 
+**なぜ `environmentVariables` を `updateParams` に含めるのか**: `UpdateAgentRuntime` API は**全項目を置換する**（部分更新ではない）。`environmentVariables` を省略すると、CFn が設定した `SESSION_STORAGE_MOUNT` や `S3_BUCKET` が消えてしまう。実際にこの問題が発生し、エージェントが Session Storage のパスを解決できず `Knowledge base directory not found` エラーになった。
+
 **`AwsCustomResource` を使う際のハマりポイント**:
 
 | 問題 | 原因と対処 |
@@ -446,7 +580,7 @@ new cr.AwsCustomResource(this, "EnableSessionStorage", {
 | `Package @aws-sdk/client-bedrockagentcorecontrol does not exist` | `service` に PascalCase (`BedrockAgentCoreControl`) を指定すると、CDK が `bedrockagentcorecontrol`（ハイフンなし）に変換してしまう。**ケバブケース `bedrock-agentcore-control` で指定**すれば正しいパッケージ `@aws-sdk/client-bedrock-agentcore-control` が解決される |
 | 上記パッケージが CDK Lambda の SDK バージョンに含まれない | `installLatestAwsSdk: true` を指定し、デプロイ時に最新 SDK をインストールさせる。JS SDK v3 には v3.1021.0 以降で含まれている（[リリースノート](https://github.com/aws/aws-sdk-js-v3/releases/tag/v3.1021.0)） |
 | `iam:PassRole` エラー | `UpdateAgentRuntime` に `roleArn` を渡すため、Custom Resource の Lambda にも `iam:PassRole` 権限が必要 |
-| `UpdateAgentRuntime` の必須パラメータ | `filesystemConfigurations` だけでなく `agentRuntimeArtifact`, `roleArn`, `networkConfiguration` も**必須**。省略すると API エラーになる |
+| `UpdateAgentRuntime` の必須パラメータ | `filesystemConfigurations` だけでなく `agentRuntimeArtifact`, `roleArn`, `networkConfiguration`, **`environmentVariables`** もすべて必須。省略すると該当フィールドが空にリセットされる |
 
 ##### (5) Lambda: S3 同期ハンドラー
 
@@ -536,7 +670,7 @@ npx cdk bootstrap
 npx cdk deploy
 
 # 5. ナレッジベースを S3 にアップロード
-aws s3 sync ../knowledge_base/ s3://agentcore-rag-kb-<ACCOUNT_ID>/knowledge_base/
+aws s3 sync ../docs/knowledge_base/ s3://agentcore-rag-kb-<ACCOUNT_ID>/knowledge_base/
 
 # 6. 動作確認
 # Session Storage の中身を確認
